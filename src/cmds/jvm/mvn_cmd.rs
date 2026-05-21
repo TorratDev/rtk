@@ -50,6 +50,17 @@ lazy_static! {
     static ref FILE_COORD: Regex = Regex::new(r"/[^:]+\.java:\[\d+,\d+\]").unwrap();
 }
 
+// ── Quiet-mode detection ────────────────────────────────────────────────────
+
+/// `mvn -q` / `mvn --quiet` suppresses all `[INFO]` lines: no `BUILD SUCCESS`
+/// footer, no `[INFO] Running` markers, no module banners. A passing run emits
+/// **zero bytes**; a failing run emits only `[ERROR]`-prefixed lines plus the
+/// stack trace. The standard filters key off `[INFO]` markers and the footer
+/// guard, so they can't fire here — `filter_quiet` handles this case instead.
+fn is_quiet(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-q" || a == "--quiet")
+}
+
 // ── Phase detection ─────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -419,6 +430,107 @@ pub fn filter_package(raw: &str) -> String {
     out
 }
 
+// ── Quiet-mode filter ───────────────────────────────────────────────────────
+
+/// Boilerplate `[ERROR]` lines Maven emits after `Failed to execute goal` —
+/// pure noise pointing at log files and help URLs, no signal for the user/LLM.
+const QUIET_BOILER_PREFIXES: &[&str] = &[
+    "[ERROR] See ",
+    "[ERROR] -> [Help",
+    "[ERROR] To see the full stack trace",
+    "[ERROR] Re-run Maven",
+    "[ERROR] For more information",
+    "[ERROR] [Help",
+];
+
+/// Filter for `mvn -q` invocations.
+///
+/// Under `-q`, Maven 3.x suppresses all `[INFO]` lines, so the standard
+/// `filter_surefire` / `filter_compile` / `filter_package` pipelines (which
+/// key off the English `BUILD SUCCESS` footer and `[INFO] Running` markers)
+/// can't fire. This filter handles the residual `-q` output shape:
+///
+/// - Green run: input is empty → output is empty (0 → 0, no overhead).
+/// - Failure run: keeps the Surefire close-line (`[ERROR] Tests run: …
+///   <<< FAILURE! -- in FQN`), the per-test failure subline, exception class,
+///   user-code stack frames, the failure summary block (`[ERROR] Failures:`,
+///   indented entries, aggregate `Tests run: N, Failures: F, …`), and the
+///   `[ERROR] Failed to execute goal` terminator. Drops framework stack
+///   frames and the post-failure boilerplate block (`See …`, `[Help 1]`,
+///   `Re-run Maven`, `To see the full stack trace`, etc.).
+pub fn filter_quiet(raw: &str) -> String {
+    let stripped = strip_ansi(raw);
+    if stripped.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut failure_trail = false;
+
+    for line in stripped.lines() {
+        // Surefire close-line for a failed class — keep + enter failure trail.
+        if CLOSE.is_match(line) {
+            out.push_str(line);
+            out.push('\n');
+            failure_trail = line.contains("<<< FAILURE!");
+            continue;
+        }
+
+        // Per-test failure subline: `[ERROR] FQN.method -- Time elapsed: … <<< FAILURE!`.
+        if line.starts_with("[ERROR] ") && line.contains("<<< FAILURE!") {
+            out.push_str(line);
+            out.push('\n');
+            failure_trail = true;
+            continue;
+        }
+
+        // Failure-trail body: exception class, user-code frames; drop framework frames.
+        if failure_trail {
+            if line.trim().is_empty() {
+                out.push('\n');
+                failure_trail = false;
+                continue;
+            }
+            let t = line.trim_start();
+            if t.starts_with("at ") && is_framework_frame(t) {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        // Failure summary keepers.
+        if line.starts_with("[ERROR] Tests run:")
+            || line.starts_with("[ERROR] Failures:")
+            || line.starts_with("[ERROR] Errors:")
+            || line.starts_with("[ERROR]   ")
+            || line.starts_with("[ERROR] Failed to execute goal")
+        {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        // Drop post-failure help boilerplate.
+        if QUIET_BOILER_PREFIXES.iter().any(|p| line.starts_with(p)) {
+            continue;
+        }
+
+        // Drop empty `[ERROR]` / `[ERROR] ` divider lines Maven emits between blocks.
+        if line.trim_end() == "[ERROR]" {
+            continue;
+        }
+
+        // Safety net: keep anything else (unexpected output under `-q` is rare;
+        // do not silently drop signal we haven't classified).
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out
+}
+
 // ── Wrapper detection ───────────────────────────────────────────────────────
 
 fn mvn_binary() -> &'static str {
@@ -463,9 +575,28 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         return runner::run_passthrough(mvn_binary(), &osargs, verbose);
     }
 
-    let phase = detect_phase(args);
     let tool = mvn_binary();
     let args_display = args.join(" ");
+
+    // Quiet mode: standard footer guard can't fire (no `BUILD SUCCESS` line
+    // under `-q`). Route to `filter_quiet` for any non-passthrough phase so
+    // failure output gets framework frames + help boilerplate stripped.
+    if is_quiet(args) {
+        let phase = detect_phase(args);
+        if matches!(phase, MvnPhase::Passthrough) {
+            let osargs: Vec<OsString> = args.iter().map(OsString::from).collect();
+            return runner::run_passthrough(tool, &osargs, verbose);
+        }
+        return runner::run_filtered(
+            new_mvn_command(args),
+            tool,
+            &args_display,
+            filter_quiet,
+            RunOptions::with_tee("mvn_quiet"),
+        );
+    }
+
+    let phase = detect_phase(args);
 
     match phase {
         MvnPhase::Test => runner::run_filtered(
@@ -923,6 +1054,132 @@ mod tests {
             savings,
             count_tokens(&i),
             count_tokens(&o)
+        );
+    }
+
+    // ── Quiet mode (`mvn -q`) ────────────────────────────────────────────────
+
+    #[test]
+    fn quiet_detects_short_flag() {
+        assert!(is_quiet(&s(["-q", "test"])));
+        assert!(is_quiet(&s(["test", "-q"])));
+        assert!(is_quiet(&s(["-B", "-q", "-DskipFoo", "install"])));
+    }
+
+    #[test]
+    fn quiet_detects_long_flag() {
+        assert!(is_quiet(&s(["--quiet", "test"])));
+    }
+
+    #[test]
+    fn quiet_does_not_match_unrelated_flags() {
+        assert!(!is_quiet(&s(["-Q", "test"])));
+        assert!(!is_quiet(&s(["-quiet", "test"])));
+        assert!(!is_quiet(&s(["-B", "test"])));
+    }
+
+    /// Green `mvn -q test` emits zero bytes; filter must return empty.
+    #[test]
+    fn quiet_green_run_is_empty() {
+        assert_eq!(filter_quiet(""), "");
+        assert_eq!(filter_quiet("   \n\n  \n"), "");
+    }
+
+    /// Failure under `-q`: keep close-line, exception, user frame, summary,
+    /// goal terminator. Drop framework frames + help boilerplate block.
+    #[test]
+    fn quiet_fail_strips_framework_and_boilerplate() {
+        let i = include_str!("../../../tests/fixtures/mvn_quiet_fail_raw.txt");
+        let o = filter_quiet(i);
+
+        // Kept: failure signal.
+        assert!(
+            o.contains("Tests run: 1, Failures: 1, Errors: 0, Skipped: 0"),
+            "close-line preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("AssertionFailedError"),
+            "exception class preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("at x.FailTest.this_will_fail"),
+            "user-code frame preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("[ERROR] Failures:"),
+            "failure summary header preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("[ERROR] Tests run: 6, Failures: 1, Errors: 0, Skipped: 0"),
+            "aggregate preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("[ERROR] Failed to execute goal"),
+            "goal terminator preserved; got:\n{}",
+            o
+        );
+
+        // Dropped: framework frames.
+        assert!(
+            !o.contains("at org.junit."),
+            "junit frame stripped; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("at java.base/"),
+            "java.base frame stripped; got:\n{}",
+            o
+        );
+
+        // Dropped: help boilerplate.
+        assert!(
+            !o.contains("To see the full stack trace"),
+            "help boilerplate stripped; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("[Help 1] http"),
+            "help link stripped; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("See /tmp/") && !o.contains("See dump files"),
+            "log-pointer lines stripped; got:\n{}",
+            o
+        );
+    }
+
+    /// Savings target on the real `mvn -q test` fail fixture.
+    #[test]
+    fn savings_mvn_quiet_fail() {
+        let i = include_str!("../../../tests/fixtures/mvn_quiet_fail_raw.txt");
+        let o = filter_quiet(i);
+        let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
+        assert!(
+            savings >= 50.0,
+            "mvn -q fail ≥50% savings, got {:.1}% (raw={} tok, filtered={} tok)",
+            savings,
+            count_tokens(i),
+            count_tokens(&o)
+        );
+    }
+
+    /// Safety net: if the `[ERROR]` line isn't on the known keep/drop lists,
+    /// the filter must NOT silently drop it. Better to leak a line than to
+    /// hide signal.
+    #[test]
+    fn quiet_unknown_error_line_kept_as_safety_net() {
+        let i = "[ERROR] Some unexpected error output we don't classify\n";
+        let o = filter_quiet(i);
+        assert!(
+            o.contains("Some unexpected error output"),
+            "unclassified ERROR line preserved; got:\n{}",
+            o
         );
     }
 }

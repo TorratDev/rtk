@@ -3919,7 +3919,7 @@ mod tests {
         // The exact reproduction from #1564: a leading `\<NL>` made
         // the matcher see `\` as the command and bail out.
         assert_eq!(
-            rewrite_command("\\\ngit diff HEAD~1", &[]),
+            rewrite_command_no_prefixes("\\\ngit diff HEAD~1", &[]),
             Some("rtk git diff HEAD~1".into())
         );
     }
@@ -3928,7 +3928,7 @@ mod tests {
     fn test_rewrite_leading_backslash_crlf() {
         // CRLF line ending — same shape, Windows shells / Git Bash.
         assert_eq!(
-            rewrite_command("\\\r\ngit diff HEAD~1", &[]),
+            rewrite_command_no_prefixes("\\\r\ngit diff HEAD~1", &[]),
             Some("rtk git diff HEAD~1".into())
         );
     }
@@ -3939,7 +3939,7 @@ mod tests {
         // `git diff \<NL>HEAD~1` is exactly equivalent to
         // `git diff HEAD~1` per bash semantics.
         assert_eq!(
-            rewrite_command("git diff \\\nHEAD~1", &[]),
+            rewrite_command_no_prefixes("git diff \\\nHEAD~1", &[]),
             Some("rtk git diff HEAD~1".into())
         );
     }
@@ -3948,7 +3948,7 @@ mod tests {
     fn test_rewrite_backslash_newline_with_indent() {
         // Continuation followed by indentation — also collapsed.
         assert_eq!(
-            rewrite_command("git \\\n    diff HEAD~1", &[]),
+            rewrite_command_no_prefixes("git \\\n    diff HEAD~1", &[]),
             Some("rtk git diff HEAD~1".into())
         );
     }
@@ -3959,7 +3959,7 @@ mod tests {
         // unchanged. This pins that the normalization step does not
         // regress the no-op fast path.
         assert_eq!(
-            rewrite_command("git diff HEAD~1", &[]),
+            rewrite_command_no_prefixes("git diff HEAD~1", &[]),
             Some("rtk git diff HEAD~1".into())
         );
     }
